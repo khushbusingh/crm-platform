@@ -1,0 +1,21 @@
+# Environment secrets — never commit, use .env.example instead
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Docker local overrides
+docker-compose.override.yml

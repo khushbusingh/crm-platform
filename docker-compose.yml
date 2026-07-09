@@ -1,0 +1,298 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crm-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      STARTUP_RETRY_ATTEMPTS: ${STARTUP_RETRY_ATTEMPTS:-10}
+      STARTUP_RETRY_DELAY_SECONDS: ${STARTUP_RETRY_DELAY_SECONDS:-3}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crmuser} -d ${POSTGRES_DB:-crmplatform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: crm-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: crm-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-crmuser}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-crmpassword}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: crm-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /tmp/kafka-logs
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - crm-net
+
+  mongo:
+    image: mongo:7
+    container_name: crm-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: crm-kafka-ui
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8081:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - crm-net
+
+  gateway:
+    build: ./gateway
+    container_name: crm-gateway
+    environment:
+      PORT: "8080"
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    networks:
+      - crm-net
+
+  bot-service:
+    build: ./services/bot-service
+    container_name: crm-bot-service
+    environment:
+      PORT: "8000"
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  assignment-service:
+    build: ./services/assignment-service
+    container_name: crm-assignment-service
+    environment:
+      PORT: "8000"
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  agent-service:
+    build: ./services/agent-service
+    container_name: crm-agent-service
+    environment:
+      PORT: "8000"
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+    ports:
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  notification-service:
+    build: ./services/notification-service
+    container_name: crm-notification-service
+    environment:
+      PORT: "8000"
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+    ports:
+      - "8004:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  ws-tester:
+    build: ./tools/ws-tester
+    container_name: crm-ws-tester
+    profiles:
+      - tools
+    networks:
+      - crm-net
+
+volumes:
+  postgres-data:
+  mongo-data:
+  kafka-data:
+
+networks:
+  crm-net:
+    driver: bridge
