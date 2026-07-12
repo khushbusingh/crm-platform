@@ -87,7 +87,8 @@ services:
     ports:
       - "27017:27017"
     volumes:
-      - mongo-data:/data/db
+    - mongo-data:/data/db
+    - ./mongo-init.sh:/docker-entrypoint-initdb.d/mongo-init.sh:ro
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 10s
@@ -154,6 +155,7 @@ services:
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      ASSIGNMENT_SERVICE_URL: ${ASSIGNMENT_SERVICE_URL:-http://assignment-service:8000}
     ports:
       - "8001:8000"
     depends_on:
