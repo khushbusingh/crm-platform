@@ -226,6 +226,7 @@ services:
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      BOT_SERVICE_URL: ${BOT_SERVICE_URL:-http://bot-service:8000}
     ports:
       - "8003:8000"
     depends_on:

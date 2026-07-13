@@ -9,6 +9,7 @@ import asyncpg
 import redis.asyncio as redis
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, HTTPException
 from pydantic import BaseModel, Field
+import httpx
 
 # ─────────────────────────────────────────────────────
 # Connection settings (Phase 0 credentials, docker-compose network)
@@ -34,6 +35,9 @@ STARTUP_RETRY_DELAY_SECONDS = int(os.environ.get("STARTUP_RETRY_DELAY_SECONDS", 
 # SET ... EX writes the key and starts this countdown in one call;
 # a heartbeat refreshes it, a missing heartbeat lets it expire on its own.
 AGENT_STATUS_TTL_SECONDS = int(os.environ.get("AGENT_STATUS_TTL_SECONDS", "90"))
+BOT_SERVICE_URL = os.environ.get("BOT_SERVICE_URL", "http://bot-service:8000")
+
+AWAITING_CONFIRMATION_TIMEOUT_MINUTES = 10
 
 
 async def _with_retry(connect_fn, name: str):
@@ -63,6 +67,7 @@ async def lifespan(app: FastAPI):
         lambda: aio_pika.connect_robust(RABBITMQ_URL), "rabbitmq"
     )
     app.state.rabbit_channel = await app.state.rabbit_conn.channel()
+    app.state.http_client = httpx.AsyncClient(base_url=BOT_SERVICE_URL, timeout=10.0)
     yield
     await app.state.pg_pool.close()
     await app.state.redis.aclose()
@@ -140,6 +145,7 @@ async def resolve_ticket(ticket_id: int):
         if ticket["assigned_agent_id"] is not None:
             agent_id = ticket["assigned_agent_id"]
             await r.decr(f"agent:{agent_id}:load")
+        await app.state.http_client.post(f"/conversations/{ticket_id}/close")
         return dict(ticket)  
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=8000)

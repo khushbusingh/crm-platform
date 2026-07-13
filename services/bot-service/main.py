@@ -367,6 +367,45 @@ async def chat(payload: ChatRequest):
     await _append_message(db, conversation_id, Sender.BOT, reply, now)
     return {"conversation_id": str(conversation_id), "reply": reply, "status": ConversationStatus.OPEN.value}
 
+@app.patch("/conversations/{ticket_id}/close")
+async def close_conversation(ticket_id: int):
+    db = app.state.mongo_db
+    now = datetime.now(timezone.utc)
+    result = await db.conversations.update_one(
+        {"ticket_id": ticket_id},
+        {"$set": {"status": ConversationStatus.CLOSED.value, "updated_at": now}},
+    )
+
+    if result.matched_count == 0:
+        return {"error": "details not found"}
+
+    return {"ticket_id": ticket_id, "status": ConversationStatus.CLOSED.value}
+
+def _serialize(doc: dict) -> dict:
+    """Converts ObjectId to str for JSON serialization."""
+    serialized = dict(doc)
+    serialized["_id"] = str(serialized["_id"])
+    return serialized
+
+@app.get("/conversations/{ticket_id}")
+async def get_conversation(ticket_id: int):
+    db = app.state.mongo_db
+    doc = await db.conversations.find_one({"ticket_id": ticket_id})
+
+    if doc is None:
+        return {"error": "details not found"}
+
+    return _serialize(doc)
+    
+@app.get("/customers/{customer_id}/conversations")
+async def get_customer_conversations(customer_id: int, exclude_ticket_id: Optional[int] = None, limit: int = 5):
+    db = app.state.mongo_db
+    query = {"customer_id": customer_id}
+    if exclude_ticket_id is not None:
+        query["ticket_id"] = {"$ne": exclude_ticket_id}
+    conversations = await db.conversations.find(query).sort("created_at", -1).limit(limit).to_list(length=limit)
+
+    return {"customer_id": customer_id, "conversations": [_serialize(c) for c in conversations]}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
