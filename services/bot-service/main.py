@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
-
+from openai import AsyncOpenAI
 import httpx
 import motor.motor_asyncio
 import uvicorn
+import json
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import FastAPI
@@ -26,6 +27,9 @@ MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "crmplatform")
 STARTUP_RETRY_ATTEMPTS = int(os.environ.get("STARTUP_RETRY_ATTEMPTS", "10"))
 STARTUP_RETRY_DELAY_SECONDS = int(os.environ.get("STARTUP_RETRY_DELAY_SECONDS", "3"))
 ASSIGNMENT_SERVICE_URL = os.environ.get("ASSIGNMENT_SERVICE_URL", "http://assignment-service:8000")
+API_KEY = os.environ.get("AZURE_OPENAI_API_KEY")
+AZURE_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
 
 AWAITING_CONFIRMATION_TIMEOUT_MINUTES = 10
 MAX_BOT_ATTEMPTS = 3
@@ -93,9 +97,20 @@ async def lifespan(app: FastAPI):
     app.state.mongo_client = await _with_retry(lambda: _connect_mongo(), "mongodb")
     app.state.mongo_db = app.state.mongo_client[MONGO_DB_NAME]
     app.state.http_client = httpx.AsyncClient(base_url=ASSIGNMENT_SERVICE_URL, timeout=10.0)
+
+    app.state.azure_open_ai = AsyncOpenAI(
+        api_key=API_KEY,
+        base_url=AZURE_ENDPOINT
+    )
+    test_response = await app.state.azure_open_ai.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT_NAME,
+        messages=[{"role": "user", "content": "say hello"}],
+    )
+    print(f"[startup] Azure OpenAI test: {test_response.choices[0].message.content}", flush=True)
     yield
     app.state.mongo_client.close()
     await app.state.http_client.aclose()
+    await app.state.azure_open_ai.close()
 
 
 app = FastAPI(title="Bot Service", lifespan=lifespan)
@@ -114,7 +129,7 @@ def health():
 # Bot logic (Phase 2A stub — see try_resolve)
 # ─────────────────────────────────────────────────────
 
-def try_resolve(message: str) -> Optional[str]:
+def try_resolve_text(message: str) -> Optional[str]:
     """Phase 2A keyword-match stub. Returns an answer if matched, else
     None. Phase 2B replaces the body of this function only — every
     caller keeps working unchanged, since the contract (str -> answer
@@ -126,6 +141,33 @@ def try_resolve(message: str) -> Optional[str]:
         return "Refunds are processed within 5-7 business days after we receive the returned item."
     return None
 
+SYSTEM_PROMPT = """You are a customer support assistant. You can only answer questions about order tracking and refunds, using exactly these facts:
+
+- Order tracking: customers can track orders at track.example.com using their order ID.
+- Refunds: processed within 5-7 business days after the returned item is received.
+
+If the question matches one of these two topics, answer using only the facts above and set resolved=true.
+Otherwise set resolved=false and leave answer empty.
+
+Respond ONLY with JSON: {"resolved": true or false, "answer": "..."}"""
+
+
+async def try_resolve(client: AsyncOpenAI, message: str) -> Optional[str]:
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": message},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    try:
+        result = json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        return None
+    print(f"[try_resolve] message: {message}, result: {result}", flush=True)
+    return result.get("answer") if result.get("resolved") else None
 
 # ─────────────────────────────────────────────────────
 # Mongo helpers — the repeated "append message" shape, in one place
@@ -211,7 +253,7 @@ async def _handle_awaiting_confirmation(db, doc: dict, now: datetime) -> Convers
     (implicit satisfaction — no reply within the window, treated as
     bot_resolved) or the customer replied again (not actually solved,
     resume as open)."""
-    elapsed_minutes = (now - doc["last_bot_reply_at"]).total_seconds() / 60
+    elapsed_minutes = (now.replace(tzinfo=None) - doc["last_bot_reply_at"]).total_seconds() / 60
 
     if elapsed_minutes >= AWAITING_CONFIRMATION_TIMEOUT_MINUTES:
         await db.conversations.update_one(
@@ -341,7 +383,7 @@ async def chat(payload: ChatRequest):
 
     await _append_message(db, conversation_id, Sender.CUSTOMER, payload.message, now)
 
-    answer = try_resolve(payload.message)
+    answer = await try_resolve(app.state.azure_open_ai, payload.message)
 
     if answer:
         await _append_message(
