@@ -151,6 +151,32 @@ Otherwise set resolved=false and leave answer empty.
 
 Respond ONLY with JSON: {"resolved": true or false, "answer": "..."}"""
 
+CLASSIFICATION_PROMPT = """...
+
+Choose ONLY one of these five categories: billing, refund, technical, delivery, general.
+
+Use "general" ONLY if the conversation genuinely doesn't relate to any of
+the other four — don't force billing/refund/technical/delivery onto
+unrelated or nonsensical input.
+
+Respond ONLY with JSON: {"category": "billing" or "refund" or "technical" or "delivery" or "general"}"""
+
+async def classify_ticket_type(client: AsyncOpenAI , messages: list) -> str:
+    conversation_text = "\n".join(f"{m['sender']}: {m['text']}" for m in messages)
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": CLASSIFICATION_PROMPT},
+            {"role": "user", "content": conversation_text},
+        ],
+        response_format={"type": "json_object"},
+    )
+    try:
+        result = json.loads(response.choices[0].message.content)
+        print(f"[classify_ticket_type] result: {result}")
+    except json.JSONDecodeError:
+        return None
+    return result.get("category")
 
 async def try_resolve(client: AsyncOpenAI, message: str) -> Optional[str]:
     response = await client.chat.completions.create(
@@ -166,7 +192,6 @@ async def try_resolve(client: AsyncOpenAI, message: str) -> Optional[str]:
         result = json.loads(response.choices[0].message.content)
     except json.JSONDecodeError:
         return None
-    print(f"[try_resolve] message: {message}, result: {result}", flush=True)
     return result.get("answer") if result.get("resolved") else None
 
 # ─────────────────────────────────────────────────────
@@ -323,13 +348,13 @@ async def resolve_conversation(db, http_client: httpx.AsyncClient, customer_id: 
 # Escalation — separated out so chat() stays readable
 # ─────────────────────────────────────────────────────
 
-async def _escalate(db, http_client: httpx.AsyncClient, conversation_id: ObjectId, customer_id: int, now: datetime) -> dict:
+async def _escalate(db, http_client: httpx.AsyncClient, conversation_id: ObjectId, ticket_type: str, customer_id: int, now: datetime) -> dict: # For Phase 2B, this will be replaced with a call to the intent classifier to determine the type
     response = await http_client.post(
         "/tickets",
         json={
             "customer_id": customer_id,
             "channel": "chat",
-            "type": ESCALATION_TICKET_TYPE,
+            "type": ticket_type,
             "priority": "P3",
         },
     )
@@ -403,7 +428,8 @@ async def chat(payload: ChatRequest):
     )
 
     if updated["bot_attempts"] >= MAX_BOT_ATTEMPTS or "agent" in payload.message.lower():
-        return await _escalate(db, http_client, conversation_id, payload.customer_id, now)
+        ticket_type = await classify_ticket_type(app.state.azure_open_ai, updated.get("messages", []))
+        return await _escalate(db, http_client, conversation_id, ticket_type, payload.customer_id, now)
 
     reply = "Could you rephrase that?"
     await _append_message(db, conversation_id, Sender.BOT, reply, now)
