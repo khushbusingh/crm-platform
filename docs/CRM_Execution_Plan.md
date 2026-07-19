@@ -57,10 +57,17 @@
 - **Interview value:** bot-first, RAG, document-store transcripts, context assembly.
 
 ### Phase 3 — Event Backbone + Notifications
-- **Build:** Kafka topics (`tickets`, `conversations`, `agent-availability`, `sla-events`); **SLA tracker** consumer (warn at 75%, breach at 100%); customer **Notification Service** (RabbitMQ → Brevo email/WhatsApp/SMS); **reassignment via DLQ**; **no-agent queue** with customer ETA.
+- **Build (task-level):**
+  - **[DONE]** Kafka topics (`tickets`, `conversations`, `agent-availability`, `sla-events`) via `kafka-init.sh` (idempotent, `--if-not-exists`).
+  - **[DONE]** Publishers: `assignment-service`→`tickets` (on creation, fires even when unassigned), `bot-service`→`conversations` (inside `_append_message`, every message), `agent-service`→`agent-availability` (connect/disconnect, audit-only).
+  - **[DONE] Agent availability — dual-layer graceful degradation (Task 5):** Redis primary fast-read with **server-driven heartbeat** (self-healing on Redis restart) + Postgres durable fallback (`status`/`current_load` synced on shift start/end + assign/resolve, NOT per-heartbeat); `assignment-service` falls back to Postgres when Redis is cold or down, so assignment degrades in latency but never fails; write-path Redis guarded (Postgres-first, Redis-best-effort); explicit `POST /agents/{id}/logout`. Closes the Phase 1 `current_load`-unused gap. Known deferred gap: Redis load-counter reconciliation on recovery after a sustained outage.
+  - **[PENDING] SLA tracker** — new service, **APScheduler + PostgreSQL job store** (NOT in-memory, NOT Redis TTL — chosen so timers survive restarts with zero Kafka replay); consumes `tickets`, schedules warn-at-75% + breach-at-100% jobs, cancels on resolved, publishes `sla-events`. `SLA_WINDOWS_MINUTES = {"P1":60,"P2":240,"P3":1440}`.
+  - **[PENDING] Notification Service** — new service, consumes `tickets` for resolved, dispatches via RabbitMQ → Brevo (email first; WhatsApp/SMS later).
+  - **[PENDING] DLQ reassignment** — RabbitMQ TTL + dead-letter-exchange on `agent.{id}.queue`; `assignment-service` consumes DLQ, reassigns, decrements original agent load.
+  - **[PENDING] No-agent queue** — holding queue + customer ETA when no eligible agent; periodic re-check.
 - **Reuse/Stub:** Brevo free tier; WhatsApp may be sandbox.
-- **Milestone:** resolve a ticket → customer receives email + SMS; let an assignment time out → it reassigns; breach an SLA → event fires.
-- **Interview value:** event-driven architecture, Kafka vs RabbitMQ split, DLQ resilience, SLA tracking.
+- **Milestone:** resolve a ticket → customer receives email; let an assignment time out → it reassigns; breach an SLA → event fires; kill Redis → assignment still works via Postgres fallback.
+- **Interview value:** event-driven architecture, Kafka vs RabbitMQ split, DLQ resilience, SLA tracking, **and a real graceful-degradation story (Redis-down fallback) with an honestly-named deferred gap (load reconciliation on recovery)**.
 
 ### Phase 4 — AI Enrichment + Supervisor Alerts
 - **Build:** Kafka consumers — **Auto-Summarizer**, **Sentiment Analyzer** (angry → raise priority), **Intent Classifier** (routing hint); **Agent Assist** (RAG suggestions in dashboard); **Supervisor Notification Service** consuming `supervisor-alerts` → **Slack webhook** + email, with AI summary + suggested action.
@@ -101,11 +108,12 @@ The voice bot is the CRM's **voice channel**, not a separate product. It shares 
 
 > **Sequencing within Phase 5:** 5A first (make the working loop a real CRM channel), then 5B (grounding — also unblocks/aligns with the chat bot's KB), then 5C (orchestration), then 5D (actions). 5B's knowledge base is shared with Phase 2's chat bot, so if Phase 2 is done, 5B partly overlaps — build the KB once.
 
-### Phase 6 — Business Actions
+### Phase 6 — Business Actions + Customer Profile
 - **Build:** **Business API Layer** (mock Order/Payment/Return/Exchange/Customer with realistic responses); agent **one-click actions** (refund/cancel/exchange); `agent_actions` audit + Kafka `agent-actions`; **circuit breaker** + timeouts on external calls.
+- **Also build: `customers` table** — add to `schema.sql` with at minimum `id, email, phone, name`. Seed with test data alongside existing `agents` seed. Update `notification-service` to look up customer email from this table using `customer_id` from the resolved Kafka event, replacing the Phase 3 hardcoded test email. This closes the known gap explicitly flagged in Phase 3's notification implementation.
 - **Reuse/Stub:** all external systems mocked (real Myntra APIs unavailable outside work — state this clearly).
-- **Milestone:** agent clicks "Initiate Refund" → mock service responds → audit logged → customer notified.
-- **Interview value:** integration layer, saga/compensation thinking, circuit breaker, "what agents actually do."
+- **Milestone:** agent clicks "Initiate Refund" → mock service responds → audit logged → customer notified at their **real email** (looked up from customers table, not a hardcoded test address).
+- **Interview value:** integration layer, saga/compensation thinking, circuit breaker, "what agents actually do," complete customer identity model.
 
 ### Phase 7 — Cloud Deployment (Azure, Single Cloud)
 - **Build:** containers → Azure Container Registry → **Azure Container Apps**; **Azure Database for PostgreSQL**, **Azure Cache for Redis**, **Azure Event Hubs** (Kafka-compatible), **CloudAMQP** (RabbitMQ), MongoDB Atlas; Azure Key Vault; Azure Front Door + Application Gateway; health probes. Same Azure account already hosts the Foundry AI plane from Phase 2B — no cross-cloud networking, single vendor.

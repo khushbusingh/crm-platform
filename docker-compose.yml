@@ -293,15 +293,14 @@ services:
     container_name: crm-notification-service
     environment:
       PORT: "8000"
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
-      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      BREVO_API_KEY: ${BREVO_API_KEY}
+      BREVO_SENDER_EMAIL: ${BREVO_SENDER_EMAIL}
+      BREVO_SENDER_NAME: ${BREVO_SENDER_NAME}
+      NOTIFICATION_TEST_EMAIL: ${NOTIFICATION_TEST_EMAIL}
+      EMAIL_PROVIDER_URL: ${EMAIL_PROVIDER_URL:-https://api.brevo.com}
       RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      
     ports:
       - "8004:8000"
     depends_on:

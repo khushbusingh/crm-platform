@@ -3,7 +3,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 from typing import Optional
-from unittest import result
 import uvicorn
 import aio_pika
 import aiokafka
@@ -125,11 +124,10 @@ async def websocket_endpoint(websocket: WebSocket, agent_id: int):
             await websocket.send_json({"error": "Agent not found"})
             await websocket.close()
             return
-        if agent["status"] != "active":
+        if agent["status"] == "offline":
             await conn.execute(
                 "UPDATE agents SET status = 'active' WHERE id = $1", agent_id
             )
-            return
         
     await r.set(f"agent:{agent_id}:status", "available", ex=AGENT_STATUS_TTL_SECONDS)
     await app.state.kafka_producer.send_and_wait(
@@ -202,6 +200,10 @@ async def resolve_ticket(ticket_id: int):
             )
             await r.decr(f"agent:{agent_id}:load")
         await app.state.http_client.post(f"/conversations/{ticket_id}/close")
+        await app.state.kafka_producer.send_and_wait(
+                "tickets",
+                json.dumps(dict(ticket), default=str).encode(),
+        )
         return dict(ticket)  
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=8000)

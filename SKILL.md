@@ -117,14 +117,14 @@ recurs — apply it any time a new inter-service call is being designed.
 | Bot Service | Python/FastAPI + Mongo (`motor`) + `httpx` | Voice+chat first responder. Phase 2A: keyword-match stub; Phase 2B swaps in real Azure OpenAI |
 | Assignment Service | Python/FastAPI | Skill+availability+priority routing — **built, verified, done** |
 | Agent Service | Python/FastAPI | WebSocket dashboard backend + resolve endpoint — **built, verified, done** |
-| Notification Service | Python/Celery | Customer Email/WhatsApp/SMS via Brevo (Phase 3+) |
+| Notification Service | Python/FastAPI + aio_pika | Customer Email via Brevo — **Phase 3 Task 7, pending** |
 | Supervisor Notification Service | Python/FastAPI | Internal Slack+email alerts, AI-enriched (Phase 4+) |
 | Business API Layer | Python/FastAPI (mocked) | Order/Payment/Return/Exchange — circuit-breakered (Phase 6+) |
-| Event backbone | Kafka (KRaft mode, no ZooKeeper) | **Phase 3+**, not yet built |
-| Task broker | RabbitMQ | Per-agent queues — **Phase 1: built**, plain queue only; TTL/DLQ/priority is Phase 3 |
+| Event backbone | Kafka (KRaft mode, no ZooKeeper) | **Phase 3: built** — 4 topics (`tickets`, `conversations`, `agent-availability`, `sla-events`); publishers on assignment/bot/agent services; `sla-tracker` consuming `tickets`, APScheduler+Postgres jobstore, publishes to `sla-events` |
+| Task broker | RabbitMQ | Per-agent queues — **Phase 1: built**, plain queue only; TTL/DLQ/priority is Phase 3 Task 8 |
 | Hot state | Redis | Agent availability via **TTL + server-driven heartbeat** (primary fast-read layer, self-healing) — **built** |
 | Source of truth | PostgreSQL (Cloud SQL) | tickets, agents, agent_actions — **built**. `current_load` + `status` now **actively synced** as the durable fallback layer for availability (Redis-down graceful degradation, Task 5) |
-| Conversation transcripts | MongoDB | Document-shaped; audit team is MongoDB-skilled, not event-driven — the deciding reason. **Phase 2A: connection built, index created, `POST /chat` in progress** |
+| Conversation transcripts | MongoDB | Document-shaped; audit team is MongoDB-skilled. **Phase 2A: fully built** — `POST /chat`, `GET /conversations/{ticket_id}`, `GET /customers/{customer_id}/conversations`, `PATCH /conversations/{ticket_id}/close` all done and tested |
 | Frontend | React, Module Federation | **Phase 9 ONLY — zero frontend exists anywhere in the codebase right now** |
 
 ## The 9 Phases — Current Status
@@ -367,6 +367,29 @@ sequenceDiagram
 is the endpoint still pending in agent-service (see Phase 2A status
 table above) — this sequence shows the *intended* full flow once that
 piece lands, not something fully verified end-to-end yet.
+
+## Phase 3 — Event Backbone (In Progress)
+
+**Done:**
+- Kafka infra: 4 topics (`tickets`, `conversations`, `agent-availability`, `sla-events`) via `kafka-init.sh` (idempotent, auto-runs on container start)
+- `assignment-service` publishes to `tickets` on every ticket creation (fires even when unassigned — SLA clock starts at creation, not assignment)
+- `bot-service` publishes to `conversations` inside `_append_message()` — every message, every branch, every status
+- `agent-service` publishes to `agent-availability` on WebSocket connect/disconnect (audit-only, server-driven)
+- **Task 5 (Redis + Postgres dual-layer)** — fully built and tested, documented in detail in §11.2 of HLD
+- **Task 6 (SLA Tracker)** — new `sla-tracker` service, fully built and tested:
+  - `AsyncIOScheduler` + `SQLAlchemyJobStore` → Postgres (`apscheduler_jobs` table auto-created)
+  - Consumes `tickets` topic, schedules `sla_warning_{id}` (75%) and `sla_breach_{id}` (100%) as `trigger="date"` jobs (one-shot, auto-removed after firing)
+  - Cancels both jobs on `status=resolved` Kafka event (early cancellation — efficiency)
+  - ALSO checks Postgres at fire time (correctness — handles the race where resolve arrives after alarm is already queued)
+  - Publishes to `sla-events` only if ticket is NOT yet resolved
+  - Module-level globals `pg_pool` and `kafka_producer` give job functions access outside request context
+  - `SLA_WINDOWS_MINUTES = {"P1": 60, "P2": 240, "P3": 1440}` as config constant
+  - Known gap: single-instance only — multi-instance needs leader election or single-owner guard (deferred to Phase 7)
+
+**Pending:**
+- Task 7: Notification Service (Kafka consumer on `tickets` for resolved → RabbitMQ → Brevo email). **Known gap: customer email hardcoded as `NOTIFICATION_TEST_EMAIL` env var** — `tickets` table only has `customer_id`, not email. A `customers` table (`id, email, phone, name`) is planned for Phase 6 alongside Business Actions; `notification-service` will be updated then to do `SELECT email FROM customers WHERE id=$1` instead of the hardcoded address. This is explicitly flagged, not hidden.
+- Task 8: DLQ reassignment (RabbitMQ TTL + dead-letter-exchange → `assignment-service` consumes DLQ)
+- Task 9: No-agent queue with customer ETA
 
 ## Production Hardening — Not Yet Built (Important, Don't Imply Otherwise)
 

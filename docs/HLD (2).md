@@ -183,7 +183,7 @@ Each component lists **responsibility**, **chosen tech**, and **why that tech ov
 ### 5.11 Datastore — Polyglot Persistence
 The store is chosen per **access pattern**, not one-size-fits-all.
 
-- **PostgreSQL (Azure Database for PostgreSQL)** — **source of truth for transactional data**: tickets, agents, agent_actions, sla_tracking, notification_log.
+- **PostgreSQL (Azure Database for PostgreSQL)** — **source of truth for transactional data**: tickets, agents, agent_actions, sla_tracking, notification_log, **customers** (Phase 6 — `id, email, phone, name`; enables notification-service to look up customer email from `customer_id` on resolved tickets, replacing the Phase 3 hardcoded test address).
   - *Why:* ACID for ticket state transitions and business actions where money/integrity matter (NFR-6, NFR-7); relational joins for history/reporting.
 - **MongoDB (Atlas / self-managed)** — **conversation transcripts**.
   - *Why:* Conversations are document-shaped with variable structure (chat vs voice vs metadata, per-message sentiment), append-heavy, read by `ticket_id`/`customer_id`, no joins, and the highest-volume data in the system. Forcing them into relational rows adds no value and caps write scale. A document store fits naturally and scales writes better.
@@ -518,6 +518,21 @@ Covered mechanically in §9.4; the *decision rationale* and rejected alternative
 **The key insight:** stop treating Redis as a cache *of* Postgres (which forces constant syncing). Treat them as two sources of truth for two different things — Redis owns "who is *currently connected* live," Postgres owns "who is *configured* as an agent and their durable load." They're not synced on every heartbeat; Redis self-heals from live heartbeats on restart, and Postgres is only written on meaningful state changes (shift start/end, assign/resolve). This gives both zero-downtime assignment (Postgres fallback) and low DB write pressure — the two requirements that seemed to conflict.
 
 **Honestly-named residual gap:** during a *sustained* Redis outage the load counters drift (missed incr/decr) and aren't yet reconciled from Postgres on recovery. Postgres stays correct throughout; the planned fix is reconciliation-on-reconnect. Named deliberately — a senior answer includes the gap it hasn't closed yet, not just the parts that work.
+
+#### Decision 4 — Two-hop notification path (Kafka → RabbitMQ → Brevo), not a direct call
+
+When a ticket resolves, the customer needs an email. The naive path is: consume the Kafka `tickets` resolved event, call Brevo directly. The chosen path adds a RabbitMQ hop in between.
+
+| Approach | What happens if Brevo is down | Retry mechanism | Verdict |
+|---|---|---|---|
+| **Kafka consumer → Brevo directly** | Consumer throws; you either lose the notification or must build custom retry/backoff logic inside the consumer | DIY | ❌ External API failures require custom retry logic |
+| **Kafka consumer → RabbitMQ → worker → Brevo** | Consumer publishes to RabbitMQ and moves on; worker retries automatically when Brevo recovers; undeliverable messages go to DLQ | Built-in via RabbitMQ TTL/DLQ | ✅ Chosen |
+
+**Why this matters:** Brevo is an external SaaS — you don't control its uptime. A direct call from a Kafka consumer means a 2-minute Brevo outage either loses notifications silently or requires you to implement exponential backoff, dead-letter handling, and retry queues yourself. RabbitMQ already has all of that built in — it's the same reason agent dispatch uses RabbitMQ rather than direct WebSocket pushes. The two-hop path separates "I know this ticket resolved" (Kafka, durable event log) from "I need to deliver this email" (RabbitMQ, task queue with retry) — each system doing what it was built for.
+
+**Why not Celery** (the original HLD wording): Celery adds a separate process, broker config, and worker management for what is, in Phase 3, a single email call. A plain `aio_pika` consumer running inside the same FastAPI service does the same job with far less infrastructure. Celery becomes justified if notification volume grows to the point of needing distributed workers — not yet.
+
+**Scope boundary for Phase 3:** email only. WhatsApp requires Meta business verification (weeks, not minutes). SMS costs money per message. Email works on Brevo's free tier immediately and proves the full pipeline.
 
 ---
 
