@@ -3,8 +3,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 from typing import Optional
+from unittest import result
 import uvicorn
 import aio_pika
+import aiokafka
 import asyncpg
 import redis.asyncio as redis
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, HTTPException
@@ -30,13 +32,13 @@ RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://crmuser:crmpassword@rabbit
 
 STARTUP_RETRY_ATTEMPTS = int(os.environ.get("STARTUP_RETRY_ATTEMPTS", "10"))
 STARTUP_RETRY_DELAY_SECONDS = int(os.environ.get("STARTUP_RETRY_DELAY_SECONDS", "3"))
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
 # Redis TTL for agent availability (Option 1: no sweep/polling needed).
 # SET ... EX writes the key and starts this countdown in one call;
 # a heartbeat refreshes it, a missing heartbeat lets it expire on its own.
 AGENT_STATUS_TTL_SECONDS = int(os.environ.get("AGENT_STATUS_TTL_SECONDS", "90"))
 BOT_SERVICE_URL = os.environ.get("BOT_SERVICE_URL", "http://bot-service:8000")
-
 AWAITING_CONFIRMATION_TIMEOUT_MINUTES = 10
 
 
@@ -56,6 +58,10 @@ async def _with_retry(connect_fn, name: str):
                   f"({attempt}/{STARTUP_RETRY_ATTEMPTS})...", flush=True)
             await asyncio.sleep(STARTUP_RETRY_DELAY_SECONDS)
 
+async def _start_kafka_producer():
+    producer = aiokafka.AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    await producer.start()
+    return producer
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -68,12 +74,16 @@ async def lifespan(app: FastAPI):
     )
     app.state.rabbit_channel = await app.state.rabbit_conn.channel()
     app.state.http_client = httpx.AsyncClient(base_url=BOT_SERVICE_URL, timeout=10.0)
+    app.state.kafka_producer = await _with_retry(
+        lambda: _start_kafka_producer(), 
+        "kafka"
+    )
     yield
     await app.state.pg_pool.close()
     await app.state.redis.aclose()
     await app.state.rabbit_channel.close()
     await app.state.rabbit_conn.close()
-
+    await app.state.kafka_producer.stop()
 
 app = FastAPI(title="agent-service", lifespan=lifespan)
 
@@ -95,16 +105,39 @@ async def consume_agent_queue(websocket: WebSocket, agent_id: str):
                 await websocket.send_json({"event": "ticket_assigned", "ticket": ticket})
 
 
+async def heartbeat_loop(agent_id: str, r: redis.Redis):
+    while True:
+        await asyncio.sleep(AGENT_STATUS_TTL_SECONDS / 2);
+        await r.set(f"agent:{agent_id}:status", "available", ex=AGENT_STATUS_TTL_SECONDS)
+
 @app.websocket("/ws/agent/{agent_id}")
-async def websocket_endpoint(websocket: WebSocket, agent_id: str):
+async def websocket_endpoint(websocket: WebSocket, agent_id: int):
     await websocket.accept()
     r: redis.Redis = app.state.redis
+    pool : asyncpg.Pool = app.state.pg_pool
     # Option 1: TTL instead of a separate last_seen key + sweep.
     # This single call sets status AND starts a 90s countdown.
+    async with pool.acquire() as conn:
+        agent = await conn.fetchrow(
+            "SELECT id, name, status FROM agents WHERE id = $1", agent_id
+        )
+        if agent is None:
+            await websocket.send_json({"error": "Agent not found"})
+            await websocket.close()
+            return
+        if agent["status"] != "active":
+            await conn.execute(
+                "UPDATE agents SET status = 'active' WHERE id = $1", agent_id
+            )
+            return
+        
     await r.set(f"agent:{agent_id}:status", "available", ex=AGENT_STATUS_TTL_SECONDS)
-
+    await app.state.kafka_producer.send_and_wait(
+        "agent-availability",
+        json.dumps({"agent_id": agent_id, "event": "connected", "status": "available", "timestamp": datetime.now(timezone.utc).isoformat()}).encode()
+    )
     consumer_task = asyncio.create_task(consume_agent_queue(websocket, agent_id))
-
+    heartbeat_loop_task = asyncio.create_task(heartbeat_loop(agent_id, r))
     try:
         while True:
             message = await websocket.receive_text()
@@ -114,16 +147,36 @@ async def websocket_endpoint(websocket: WebSocket, agent_id: str):
             await r.set(f"agent:{agent_id}:status", "available", ex=AGENT_STATUS_TTL_SECONDS)
     except WebSocketDisconnect:
         print(f"WebSocket connection closed for agent {agent_id}")
+        heartbeat_loop_task.cancel()
     except Exception as e:
         print(f"Unexpected error for agent {agent_id}: {e}")
     finally:
         consumer_task.cancel()
+        heartbeat_loop_task.cancel()
         # Clean disconnect: delete immediately rather than waiting up
         # to 90s for the TTL to expire naturally — we already know
         # for certain, right now, that this agent is gone.
+        await app.state.kafka_producer.send_and_wait(
+            "agent-availability",
+            json.dumps({"agent_id": agent_id, "event": "disconnected", "status": "unavailable", "timestamp": datetime.now(timezone.utc).isoformat()}).encode()
+        )
         await r.delete(f"agent:{agent_id}:status")
         await websocket.close()
 
+@app.post("/agents/{agent_id}/logout")
+async def agent_logout(agent_id: int):
+    r : redis.Redis = app.state.redis
+    pool : asyncpg.Pool = app.state.pg_pool
+
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE agents SET status = 'offline' WHERE id = $1", agent_id
+        )
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="agent not found")
+    await r.delete(f"agent:{agent_id}:status")
+    return {"agent_id": agent_id, "status": "offline"} 
+    
 @app.post("/tickets/{ticket_id}/resolve")
 async def resolve_ticket(ticket_id: int):
     pool: asyncpg.Pool = app.state.pg_pool
@@ -144,6 +197,9 @@ async def resolve_ticket(ticket_id: int):
         # Notify the assigned agent if any
         if ticket["assigned_agent_id"] is not None:
             agent_id = ticket["assigned_agent_id"]
+            await conn.execute(
+                "UPDATE agents SET current_load = GREATEST(current_load - 1, 0) WHERE id = $1", agent_id
+            )
             await r.decr(f"agent:{agent_id}:load")
         await app.state.http_client.post(f"/conversations/{ticket_id}/close")
         return dict(ticket)  

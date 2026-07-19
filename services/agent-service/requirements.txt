@@ -4,3 +4,4 @@ asyncpg==0.29.0
 redis==5.0.1
 aio-pika==9.4.1
 httpx==0.28.1
+aiokafka==0.11.0

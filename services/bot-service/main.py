@@ -9,6 +9,7 @@ import httpx
 import motor.motor_asyncio
 import uvicorn
 import json
+import aiokafka
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import FastAPI
@@ -30,16 +31,9 @@ ASSIGNMENT_SERVICE_URL = os.environ.get("ASSIGNMENT_SERVICE_URL", "http://assign
 API_KEY = os.environ.get("AZURE_OPENAI_API_KEY")
 AZURE_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
-
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 AWAITING_CONFIRMATION_TIMEOUT_MINUTES = 10
 MAX_BOT_ATTEMPTS = 3
-
-# TODO(Phase 2B): replace with LLM-inferred type (HLD §5.13 Intent
-# Classifier). Hardcoded to a known-matching value so escalation
-# actually produces an ASSIGNED ticket during Phase 2A testing — no
-# seeded agent has "general" in skills.
-ESCALATION_TICKET_TYPE = "billing"
-
 
 # ─────────────────────────────────────────────────────
 # Domain vocabulary — single source of truth, no bare strings
@@ -91,27 +85,28 @@ async def _connect_mongo():
     await client.admin.command("ping")
     return client
 
+async def _start_kafka_producer():
+    producer = aiokafka.AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    await producer.start()
+    return producer
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.mongo_client = await _with_retry(lambda: _connect_mongo(), "mongodb")
     app.state.mongo_db = app.state.mongo_client[MONGO_DB_NAME]
     app.state.http_client = httpx.AsyncClient(base_url=ASSIGNMENT_SERVICE_URL, timeout=10.0)
-
+    app.state.kafka_producer = await _with_retry(
+        lambda:_start_kafka_producer(), "kafka"
+    )
     app.state.azure_open_ai = AsyncOpenAI(
         api_key=API_KEY,
         base_url=AZURE_ENDPOINT
     )
-    test_response = await app.state.azure_open_ai.chat.completions.create(
-        model=AZURE_OPENAI_DEPLOYMENT_NAME,
-        messages=[{"role": "user", "content": "say hello"}],
-    )
-    print(f"[startup] Azure OpenAI test: {test_response.choices[0].message.content}", flush=True)
     yield
     app.state.mongo_client.close()
     await app.state.http_client.aclose()
     await app.state.azure_open_ai.close()
-
+    await app.state.kafka_producer.stop()
 
 app = FastAPI(title="Bot Service", lifespan=lifespan)
 
@@ -198,7 +193,7 @@ async def try_resolve(client: AsyncOpenAI, message: str) -> Optional[str]:
 # Mongo helpers — the repeated "append message" shape, in one place
 # ─────────────────────────────────────────────────────
 
-async def _append_message(db, conversation_id: ObjectId, sender: Sender, text: str, now: datetime, extra_fields: Optional[dict] = None):
+async def _append_message(db, customer_id: int, conversation_id: ObjectId, sender: Sender, text: str, now: datetime, extra_fields: Optional[dict] = None):
     """Pushes one message onto a conversation and always bumps
     updated_at. extra_fields lets a caller set additional fields
     (e.g. status, last_bot_reply_at) in the same atomic update."""
@@ -212,6 +207,16 @@ async def _append_message(db, conversation_id: ObjectId, sender: Sender, text: s
             "$push": {"messages": {"sender": sender.value, "text": text, "timestamp": now}},
             "$set": fields_to_set,
         },
+    )
+    await app.state.kafka_producer.send_and_wait(
+        "conversations",
+        json.dumps({
+            "customer_id": customer_id,
+            "conversation_id": str(conversation_id),
+            "sender": sender.value,
+            "text": text,
+            "timestamp": now.isoformat(),
+        }).encode(),
     )
 
 
@@ -305,7 +310,7 @@ async def _handle_escalated(db, http_client: httpx.AsyncClient, doc: dict, messa
     ticket = response.json()
 
     if ticket["status"] == TicketStatus.ASSIGNED.value:
-        await _append_message(db, doc["_id"], Sender.CUSTOMER, message, now)
+        await _append_message(db, doc['customer_id'], doc["_id"], Sender.CUSTOMER, message, now)
         return ConversationResolution(
             action=ResolutionAction.ALREADY_HANDLED,
             response={
@@ -406,13 +411,13 @@ async def chat(payload: ChatRequest):
     else:
         conversation_id = resolution.conversation_id
 
-    await _append_message(db, conversation_id, Sender.CUSTOMER, payload.message, now)
+    await _append_message(db, payload.customer_id, conversation_id, Sender.CUSTOMER, payload.message, now)
 
     answer = await try_resolve(app.state.azure_open_ai, payload.message)
 
     if answer:
         await _append_message(
-            db, conversation_id, Sender.BOT, answer, now,
+            db, payload.customer_id, conversation_id, Sender.BOT, answer, now,
             extra_fields={"status": ConversationStatus.AWAITING_CONFIRMATION.value, "last_bot_reply_at": now},
         )
         return {
@@ -432,7 +437,7 @@ async def chat(payload: ChatRequest):
         return await _escalate(db, http_client, conversation_id, ticket_type, payload.customer_id, now)
 
     reply = "Could you rephrase that?"
-    await _append_message(db, conversation_id, Sender.BOT, reply, now)
+    await _append_message(db, payload.customer_id, conversation_id, Sender.BOT, reply, now)
     return {"conversation_id": str(conversation_id), "reply": reply, "status": ConversationStatus.OPEN.value}
 
 @app.patch("/conversations/{ticket_id}/close")

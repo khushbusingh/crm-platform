@@ -5,6 +5,7 @@ import json
 from typing import Optional
 import uvicorn
 import aio_pika
+import aiokafka
 import asyncpg
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException
@@ -26,6 +27,7 @@ POSTGRES_DSN = os.environ.get(
 )
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://crmuser:crmpassword@rabbitmq:5672/")
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
 STARTUP_RETRY_ATTEMPTS = int(os.environ.get("STARTUP_RETRY_ATTEMPTS", "10"))
 STARTUP_RETRY_DELAY_SECONDS = int(os.environ.get("STARTUP_RETRY_DELAY_SECONDS", "3"))
@@ -47,6 +49,10 @@ async def _with_retry(connect_fn, name: str):
                   f"({attempt}/{STARTUP_RETRY_ATTEMPTS})...", flush=True)
             await asyncio.sleep(STARTUP_RETRY_DELAY_SECONDS)
 
+async def _start_kafka_producer():
+    producer = aiokafka.AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    await producer.start()
+    return producer
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -58,12 +64,16 @@ async def lifespan(app: FastAPI):
         lambda: aio_pika.connect_robust(RABBITMQ_URL), "rabbitmq"
     )
     app.state.rabbit_channel = await app.state.rabbit_conn.channel()
+    app.state.kafka_producer = await _with_retry(
+        lambda:_start_kafka_producer(), "kafka"
+    )
+
     yield
     await app.state.pg_pool.close()
     await app.state.redis.aclose()
     await app.state.rabbit_channel.close()
     await app.state.rabbit_conn.close()
-
+    await app.state.kafka_producer.stop()
 
 app = FastAPI(title="assignment-service", lifespan=lifespan)
 
@@ -84,13 +94,38 @@ def health():
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-
 class TicketCreate(BaseModel):
     customer_id: int
     channel: str = Field(pattern="^(chat|phone)$")
     type: str  # matched against agents.skills, e.g. "billing"
     priority: str = Field(default="P3", pattern="^(P1|P2|P3)$")
 
+
+async def get_agent_status(pool, redis_client, agent_id: int):
+    try:
+        status = await redis_client.get(f"agent:{agent_id}:status")
+        load = await redis_client.get(f"agent:{agent_id}:load")
+
+        if status is not None:
+            return status, int(load) if load else 0
+
+    except Exception as e:
+        print(f"Redis error: {e}")
+
+    async with pool.acquire() as conn:
+        agent = await conn.fetchrow(
+            """
+            SELECT status, current_load
+            FROM agents
+            WHERE id = $1
+            """,
+            agent_id,
+        )
+
+    if agent is None:
+        return None, 0
+
+    return agent["status"], agent["current_load"]
 
 @app.post("/tickets", status_code=201)
 async def create_ticket(payload: TicketCreate):
@@ -116,17 +151,15 @@ async def create_ticket(payload: TicketCreate):
             "SELECT id FROM agents WHERE $1 = ANY(skills) ORDER BY id",
             payload.type,
         )
-
+    # Step 2 — also publish to Kafka for analytics/monitoring.
+    await app.state.kafka_producer.send_and_wait(
+        "tickets",
+        json.dumps(dict(ticket), default=str).encode(),
+    )
     agent_id: Optional[int] = None
     for row in candidates:
         candidate_id = row["id"]
-        status = await r.get(f"agent:{candidate_id}:status")
-        load = await r.get(f"agent:{candidate_id}:load")
-        load = int(load) if load is not None else 0
-
-        # TODO(Phase 1 known gap, see HLD §11.1): this is a read-then-act
-        # check, not atomic. Fine for a single-instance Phase 1 demo;
-        # revisit with a Lua script before Phase 3 horizontal scaling.
+        status, load = await get_agent_status(pool, r, candidate_id)
         if status == "available" and load < 5:
             agent_id = candidate_id
             break
@@ -149,7 +182,14 @@ async def create_ticket(payload: TicketCreate):
         )
 
     # Step 4 — atomic increment of the fast-read copy.
-    await r.incr(f"agent:{agent_id}:load")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agents SET current_load = current_load + 1 WHERE id = $1", agent_id
+        )
+    try:
+        await r.incr(f"agent:{agent_id}:load")
+    except Exception as e:
+        print(f"Redis incr failed (agent {agent_id}), Postgres is source of truth: {e}")
 
     # Step 5 — hand the task to the agent's queue. Plain queue, no
     # TTL/priority args yet (that's Phase 3's ack-timeout + DLQ work).

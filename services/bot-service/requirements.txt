@@ -3,3 +3,4 @@ uvicorn==0.32.0
 motor==3.6.0
 httpx==0.28.1
 openai
+aiokafka==0.11.0

@@ -122,8 +122,8 @@ recurs — apply it any time a new inter-service call is being designed.
 | Business API Layer | Python/FastAPI (mocked) | Order/Payment/Return/Exchange — circuit-breakered (Phase 6+) |
 | Event backbone | Kafka (KRaft mode, no ZooKeeper) | **Phase 3+**, not yet built |
 | Task broker | RabbitMQ | Per-agent queues — **Phase 1: built**, plain queue only; TTL/DLQ/priority is Phase 3 |
-| Hot state | Redis | Agent availability via **TTL** (not a sweep — see Phase 1 section) — **built** |
-| Source of truth | PostgreSQL (Cloud SQL) | tickets, agents, agent_actions — **Phase 1: built**. `current_load` column unused (Redis is sole live-load source; known, accepted gap) |
+| Hot state | Redis | Agent availability via **TTL + server-driven heartbeat** (primary fast-read layer, self-healing) — **built** |
+| Source of truth | PostgreSQL (Cloud SQL) | tickets, agents, agent_actions — **built**. `current_load` + `status` now **actively synced** as the durable fallback layer for availability (Redis-down graceful degradation, Task 5) |
 | Conversation transcripts | MongoDB | Document-shaped; audit team is MongoDB-skilled, not event-driven — the deciding reason. **Phase 2A: connection built, index created, `POST /chat` in progress** |
 | Frontend | React, Module Federation | **Phase 9 ONLY — zero frontend exists anywhere in the codebase right now** |
 
@@ -177,14 +177,50 @@ Service's background `asyncio.create_task` consumer (`queue.iterator()`,
 ticket:{...}}` → `POST /tickets/{id}/resolve` → UPDATE resolved
 (Postgres) + atomic Redis `DECR`.
 
-**Agent availability — Redis TTL, not a sweep (deliberate design
-change from the original plan).** `SET agent:{id}:status available EX 90`
-on connect and on every heartbeat (refreshes the countdown). No
-`last_seen` key, no background polling loop at all — if heartbeats stop
-(crashed client), Redis deletes the key on its own. Clean disconnect →
-explicit `DELETE` rather than waiting for TTL. This replaced an earlier
-sweep-based design specifically to avoid polling — chosen deliberately,
-not a simplification to revisit.
+**Agent availability — dual-layer, graceful degradation (Task 5, the
+production-grade version).** Two independent layers, deliberately NOT
+synced on every heartbeat:
+
+- **Redis = primary fast-read layer.** `SET agent:{id}:status available
+  EX 90`, refreshed by a **server-driven heartbeat** — `agent-service`
+  runs a background `asyncio` task (`heartbeat_loop`, sleeps 30s,
+  re-SETs the key), cancelled in `finally` on disconnect. NOT client-
+  driven — the frontend's only job is keeping the WebSocket open;
+  the server owns the heartbeat. This makes Redis **self-healing**:
+  after a Redis *restart* (cold, keys gone), each connected agent's
+  next heartbeat repopulates their key within ≤30s, no backfill job,
+  no reconnect, no intervention.
+- **Postgres = durable fallback layer.** `agents.status` +
+  `current_load` written on **shift start/end + assign/resolve only**
+  (NOT every heartbeat — that would be ~1.4M writes/day at 500 agents;
+  shift+ticket writes are ~2000/day, negligible). `assignment-service`
+  reads Redis first; if Redis returns `None` (cold key) OR throws
+  (Redis *down*), it falls through to a Postgres query. A Redis
+  *restart* self-heals via heartbeat; a sustained Redis *failure* is
+  covered by the Postgres fallback. Two different failure modes, two
+  mechanisms — neither alone is sufficient.
+
+`get_agent_status(pool, redis, agent_id)` helper encapsulates the
+Redis-primary/Postgres-fallback read. Redis writes on the *write* path
+(`incr`/`decr` load) are also try/except-guarded, with Postgres updated
+FIRST (durable) and Redis second (best-effort) — so a ticket still
+assigns correctly with Redis down. Login = WS connect writes
+`status='available'` to Postgres; explicit `POST /agents/{id}/logout`
+writes `status='offline'` + deletes the Redis key (logout is a business
+action — shift end — NOT a system-failure cleanup; TTL handles crashes).
+
+**Known gap, deliberately deferred (good interview material):** on Redis
+*recovery* after a sustained outage, the `load` counters are stale —
+they missed every incr/decr that happened while down. Postgres has
+correct values. Fix is a reconciliation step that rehydrates Redis load
+from Postgres on reconnect (Postgres = durable source of truth). Not yet
+built; noted as a known gap, not an oversight.
+
+**Original Phase 1 note (still true):** this replaced an even earlier
+sweep-based (`last_seen` + polling loop) design — the no-polling
+instinct that drove that choice is the same one behind APScheduler-not-
+polling for SLA (Phase 3) and lazy-not-swept `awaiting_confirmation`
+(Phase 2A).
 
 **Known limitation, verified and accepted:** assignment picks the
 lowest-ID eligible agent every time (`ORDER BY id`, first match, not

@@ -80,7 +80,18 @@ services:
       retries: 10
     networks:
       - crm-net
-
+      
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: crm-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./kafka-init.sh:/kafka-init.sh
+    entrypoint: ["bash", "/kafka-init.sh"]
+    networks:
+      - crm-net
   mongo:
     image: mongo:7
     container_name: crm-mongo
@@ -111,35 +122,35 @@ services:
     networks:
       - crm-net
 
-  gateway:
-    build: ./gateway
-    container_name: crm-gateway
-    environment:
-      PORT: "8080"
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
-      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
-      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
-    networks:
-      - crm-net
+  # gateway:
+  #   build: ./gateway
+  #   container_name: crm-gateway
+  #   environment:
+  #     PORT: "8080"
+  #     POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+  #     POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  #     POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+  #     POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+  #     REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  #     RABBITMQ_URL: ${RABBITMQ_URL:-amqp://crmuser:crmpassword@rabbitmq:5672/}
+  #     KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+  #     MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     rabbitmq:
+  #       condition: service_healthy
+  #     kafka:
+  #       condition: service_healthy
+  #     mongo:
+  #       condition: service_healthy
+  #   networks:
+  #     - crm-net
 
   bot-service:
     build: ./services/bot-service
@@ -242,6 +253,32 @@ services:
       kafka:
         condition: service_healthy
       mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crm-net
+
+  sla-service:
+    build: ./services/sla-service
+    container_name: crm-sla-service
+    environment:
+      PORT: "8000"
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-crmplatform}
+      POSTGRES_USER: ${POSTGRES_USER:-crmuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crmpassword}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+    ports:
+      - "8005:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
