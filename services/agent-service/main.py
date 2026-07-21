@@ -39,7 +39,8 @@ KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"
 AGENT_STATUS_TTL_SECONDS = int(os.environ.get("AGENT_STATUS_TTL_SECONDS", "90"))
 BOT_SERVICE_URL = os.environ.get("BOT_SERVICE_URL", "http://bot-service:8000")
 AWAITING_CONFIRMATION_TIMEOUT_MINUTES = 10
-
+# Priority-based TTL in milliseconds
+AGENT_QUEUE_TTL_MS = 30_000
 
 async def _with_retry(connect_fn, name: str):
     # Dependencies report healthy via Docker healthcheck slightly before
@@ -96,7 +97,15 @@ def health():
 
 async def consume_agent_queue(websocket: WebSocket, agent_id: str):
     queue_name = f"agent.{agent_id}.queue"
-    queue = await app.state.rabbit_channel.declare_queue(queue_name, durable=True)
+    queue = await app.state.rabbit_channel.declare_queue(
+        queue_name, 
+        durable=True,
+        arguments={
+            "x-message-ttl": AGENT_QUEUE_TTL_MS,
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": "dead.letter.queue",
+        }
+    )
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
             async with message.process():
@@ -124,9 +133,10 @@ async def websocket_endpoint(websocket: WebSocket, agent_id: int):
             await websocket.send_json({"error": "Agent not found"})
             await websocket.close()
             return
+        print(f"[agent-service] agent {agent_id} , {agent['status']} connected via WebSocket", flush=True)
         if agent["status"] == "offline":
             await conn.execute(
-                "UPDATE agents SET status = 'active' WHERE id = $1", agent_id
+                "UPDATE agents SET status = 'available' WHERE id = $1", agent_id
             )
         
     await r.set(f"agent:{agent_id}:status", "available", ex=AGENT_STATUS_TTL_SECONDS)

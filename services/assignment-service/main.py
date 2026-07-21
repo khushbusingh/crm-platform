@@ -32,6 +32,8 @@ KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"
 STARTUP_RETRY_ATTEMPTS = int(os.environ.get("STARTUP_RETRY_ATTEMPTS", "10"))
 STARTUP_RETRY_DELAY_SECONDS = int(os.environ.get("STARTUP_RETRY_DELAY_SECONDS", "3"))
 
+# Priority-based TTL in milliseconds
+AGENT_QUEUE_TTL_MS = 30_000
 
 async def _with_retry(connect_fn, name: str):
     # Dependencies report healthy via Docker healthcheck slightly before
@@ -54,6 +56,72 @@ async def _start_kafka_producer():
     await producer.start()
     return producer
 
+async def consume_dead_queue(channel, pg_pool,r):
+    dead_queue = await channel.declare_queue(
+        "dead.letter.queue", durable=True
+    )
+    async with dead_queue.iterator() as queue_iter:    
+        async for message in queue_iter:
+            async with message.process():
+                ticket = json.loads(message.body.decode())
+                priority = ticket["priority"]
+                skill = ticket["type"]
+                retry_count = int(message.headers.get("x-retry-count", "0")) + 1
+                if retry_count >= 3:
+                    print(f"[DLQ] ticket {ticket['id']} exhausted retries, dropping")
+                    # message.process() acks it — won't loop back
+                    continue
+                async with pg_pool.acquire() as conn:
+                    candidates = await conn.fetch(
+                        "SELECT id FROM agents WHERE $1 = ANY(skills) ORDER BY id",
+                        skill,
+                    )
+                new_agent_id = None
+                for row in candidates:
+                    candidate_id = row["id"]
+                    if candidate_id == ticket["assigned_agent_id"]:
+                        continue
+                    status = await r.get(f"agent:{candidate_id}:status")
+                    load = int(await r.get(f"agent:{candidate_id}:load") or 0)
+                    if status == "available" and load < 5:
+                        new_agent_id = candidate_id
+                        break
+                if new_agent_id is None:
+                    print(f"[DLQ] No eligible agent for ticket {ticket['id']}, dropping")
+                    continue
+
+                await r.decr(f"agent:{ticket['assigned_agent_id']}:load")
+                async with pg_pool.acquire() as conn:
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE tickets SET assigned_agent_id = $1
+                        WHERE id = $2
+                        RETURNING id, customer_id, channel, type, priority, status,
+                                  assigned_agent_id, created_at
+                        """,
+                        new_agent_id, ticket["id"],
+                    )
+                await r.incr(f"agent:{new_agent_id}:load")
+                queue_name = f"agent.{new_agent_id}.queue"
+                await channel.declare_queue(
+                    queue_name, 
+                    durable=True, 
+                    arguments={
+                        "x-message-ttl": AGENT_QUEUE_TTL_MS,
+                        "x-dead-letter-exchange": "",
+                        "x-dead-letter-routing-key": "dead.letter.queue"
+                    }
+                )
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps(dict(updated), default=str).encode(),
+                        headers={"x-retry-count": retry_count},
+                        content_type="application/json",
+                    ),
+                    routing_key=queue_name,
+                )
+                print(f"[DLQ] ticket {ticket['id']} reassigned to agent {new_agent_id} (retry {retry_count})")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pg_pool = await _with_retry(
@@ -67,13 +135,14 @@ async def lifespan(app: FastAPI):
     app.state.kafka_producer = await _with_retry(
         lambda:_start_kafka_producer(), "kafka"
     )
-
+    dead_letter_task = asyncio.create_task(consume_dead_queue(app.state.rabbit_channel, app.state.pg_pool, app.state.redis) )
     yield
     await app.state.pg_pool.close()
     await app.state.redis.aclose()
     await app.state.rabbit_channel.close()
     await app.state.rabbit_conn.close()
     await app.state.kafka_producer.stop()
+    dead_letter_task.cancel()
 
 app = FastAPI(title="assignment-service", lifespan=lifespan)
 
@@ -106,19 +175,18 @@ async def get_agent_status(pool, redis_client, agent_id: int):
         status = await redis_client.get(f"agent:{agent_id}:status")
         load = await redis_client.get(f"agent:{agent_id}:load")
 
-        if status is not None:
-            return status, int(load) if load else 0
+        # Redis responded — trust it completely regardless of value
+        # None means key expired (agent disconnected), not Redis down
+        # Don't fall through to Postgres in this case
+        return status, int(load) if load else 0
 
     except Exception as e:
-        print(f"Redis error: {e}")
+        print(f"[fallback] Redis unreachable for agent {agent_id}: {e}", flush=True)
 
+    # Only reaches here if Redis threw an exception (genuinely unreachable)
     async with pool.acquire() as conn:
         agent = await conn.fetchrow(
-            """
-            SELECT status, current_load
-            FROM agents
-            WHERE id = $1
-            """,
+            "SELECT status, current_load FROM agents WHERE id = $1",
             agent_id,
         )
 
@@ -144,7 +212,7 @@ async def create_ticket(payload: TicketCreate):
             """,
             payload.customer_id, payload.channel, payload.type, payload.priority,
         )
-
+       
         # Step 2 — find agents with the matching skill (Postgres is the
         # only place skills live; Redis only knows availability/load).
         candidates = await conn.fetch(
@@ -194,11 +262,20 @@ async def create_ticket(payload: TicketCreate):
     # Step 5 — hand the task to the agent's queue. Plain queue, no
     # TTL/priority args yet (that's Phase 3's ack-timeout + DLQ work).
     queue_name = f"agent.{agent_id}.queue"
-    await app.state.rabbit_channel.declare_queue(queue_name, durable=True)
+    await app.state.rabbit_channel.declare_queue(
+        queue_name, 
+        durable=True, 
+        arguments= {
+            "x-message-ttl": AGENT_QUEUE_TTL_MS,
+            "x-dead-letter-exchange": "",
+            "x-dead-letter-routing-key": "dead.letter.queue"
+        }
+    )
     await app.state.rabbit_channel.default_exchange.publish(
         aio_pika.Message(
             body=json.dumps(dict(ticket),default=str).encode(),
             content_type="application/json",
+            headers={"x-retry-count": 0},
         ),
         routing_key=queue_name,
     )
