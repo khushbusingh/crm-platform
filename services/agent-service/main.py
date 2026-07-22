@@ -63,6 +63,7 @@ async def _start_kafka_producer():
     await producer.start()
     return producer
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pg_pool = await _with_retry(
@@ -73,11 +74,10 @@ async def lifespan(app: FastAPI):
         lambda: aio_pika.connect_robust(RABBITMQ_URL), "rabbitmq"
     )
     app.state.rabbit_channel = await app.state.rabbit_conn.channel()
-    app.state.http_client = httpx.AsyncClient(base_url=BOT_SERVICE_URL, timeout=10.0)
     app.state.kafka_producer = await _with_retry(
-        lambda: _start_kafka_producer(), 
-        "kafka"
+        lambda: _start_kafka_producer(), "kafka"
     )
+
     yield
     await app.state.pg_pool.close()
     await app.state.redis.aclose()
